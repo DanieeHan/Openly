@@ -2,8 +2,12 @@ import AppKit
 let folder = CommandLine.arguments[1]
 try FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
 func render(_ pixels: Int) -> Data {
-    let image = NSImage(size: NSSize(width: pixels, height: pixels))
-    image.lockFocus()
+    // Fixed pixels avoid lockFocus doubling dimensions on Retina displays.
+    let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+        colorSpaceName: .deviceRGB, bytesPerRow: pixels * 4, bitsPerPixel: 32)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)!
     let scale = CGFloat(pixels) / 1024
     NSGraphicsContext.current!.cgContext.scaleBy(x: scale, y: scale)
     let rect = NSRect(x: 70, y: 70, width: 884, height: 884)
@@ -20,8 +24,7 @@ func render(_ pixels: Int) -> Data {
     arrow.move(to: NSPoint(x: 553, y: 722)); arrow.line(to: NSPoint(x: 723, y: 722)); arrow.line(to: NSPoint(x: 723, y: 552))
     arrow.lineWidth = 66; arrow.lineCapStyle = .round; arrow.lineJoinStyle = .round
     NSColor(calibratedWhite: 0.96, alpha: 1).setStroke(); arrow.stroke()
-    image.unlockFocus()
-    let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
+    NSGraphicsContext.restoreGraphicsState()
     return bitmap.representation(using: .png, properties: [:])!
 }
 for size in [16, 32, 128, 256, 512] {

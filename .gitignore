@@ -1,6 +1,7 @@
 .DS_Store
 .build/
 dist/
+work/
 *.app/
 *.zip
 *.dSYM/

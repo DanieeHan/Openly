@@ -7,7 +7,10 @@ staging_root=$(mktemp -d /tmp/openly-build.XXXXXX)
 trap 'rm -rf "$staging_root"' EXIT
 staging="$staging_root/Openly.app"
 mkdir -p "$staging/Contents/MacOS" "$staging/Contents/Resources"
-swiftc -swift-version 5 -O -target "${build_arch}-apple-macosx13.0" Sources/Model.swift Sources/Openly.swift -o "$staging/Contents/MacOS/Openly"
+swiftc -swift-version 5 -Osize -whole-module-optimization -Xlinker -dead_strip \
+    -target "${build_arch}-apple-macosx13.0" Sources/Model.swift Sources/Openly.swift \
+    -o "$staging/Contents/MacOS/Openly"
+xcrun strip -S -x "$staging/Contents/MacOS/Openly"
 cp Resources/Info.plist "$staging/Contents/Info.plist"
 cp LICENSE "$staging/Contents/Resources/LICENSE"
 if [[ -f Resources/AppIcon.icns ]]; then
