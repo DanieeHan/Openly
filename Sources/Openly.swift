@@ -1,12 +1,15 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Combine
 
 // Explicit alias keeps the property wrapper distinct from newer SDK State macros.
 private typealias ViewState<Value> = SwiftUI.State<Value>
 private let applicationColumnWidth: CGFloat = 228
 
+#if !OPENLY_TESTING
 @main
+#endif
 struct OpenlyApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model = AppModel()
@@ -16,6 +19,7 @@ struct OpenlyApp: App {
             MainView().environmentObject(model)
                 .frame(minWidth: 720, minHeight: 460)
                 .tint(.primary)
+                .onAppear { delegate.attach(model) }
         }
         .defaultSize(width: 800, height: 560)
         .windowStyle(.hiddenTitleBar)
@@ -30,10 +34,35 @@ struct OpenlyApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private weak var model: AppModel?
+    private var busyObservation: AnyCancellable?
+    private var waitingForMutation = false
+
+    func attach(_ model: AppModel) {
+        guard self.model !== model else { return }
+        self.model = model
+        busyObservation = model.$busy.removeDuplicates().sink { [weak self] busy in
+            guard !busy else { return }
+            // Published values are delivered before assignment; finish after the model's defer.
+            DispatchQueue.main.async {
+                guard let self, self.waitingForMutation, self.model?.busy == false else { return }
+                self.waitingForMutation = false
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model, model.busy else { return .terminateNow }
+        waitingForMutation = true
+        model.requestStop()
+        return .terminateLater
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
@@ -42,6 +71,7 @@ struct MainView: View {
     @EnvironmentObject var model: AppModel
     @ViewState private var showAdd = false
     @ViewState private var showHistory = false
+    @ViewState private var showReport = false
     @ViewState private var newExtension = ""
     @ViewState private var dropTarget = false
     @FocusState private var searchFocused: Bool
@@ -55,16 +85,7 @@ struct MainView: View {
             VStack(spacing: 0) {
                 header
                 searchBar
-                if !model.selectedIDs.isEmpty { selectionBar }
-                HStack(spacing: 16) {
-                    Text("文件类型").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("默认应用").frame(width: applicationColumnWidth, alignment: .leading)
-                }
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 10)
+                selectionBar
                 Divider().padding(.horizontal, 20)
                 if visible.isEmpty {
                     emptyState
@@ -100,11 +121,15 @@ struct MainView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             model.refreshIfNeeded()
         }
-        .alert("操作未完成", isPresented: Binding(get: { model.error != nil && !showHistory && !showAdd }, set: { if !$0 { model.error = nil } })) {
+        .alert("操作未完成", isPresented: Binding(get: { model.error != nil && !showHistory && !showAdd && !showReport }, set: { if !$0 { model.error = nil } })) {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .sheet(isPresented: $showHistory) { HistoryView().environmentObject(model) }
         .sheet(isPresented: $showAdd) { addSheet }
+        .sheet(isPresented: $showReport) { BatchReportView().environmentObject(model) }
+        .onChange(of: model.batchReport?.id) { id in
+            if id != nil && !showHistory && !showAdd && batchNeedsAttention(model.batchReport) { showReport = true }
+        }
     }
 
     private var sidebar: some View {
@@ -203,25 +228,34 @@ struct MainView: View {
     }
 
     private var selectionBar: some View {
-        HStack(spacing: 12) {
-            Text("已选 \(model.selectedIDs.count) 项")
-                .font(.system(size: 11, weight: .medium))
-                .monospacedDigit()
-                .fixedSize()
-            Button("全选") { model.selectAllVisible() }
-                .accessibilityLabel("选择当前列表全部文件类型")
-            Button("清除") { model.clearSelection() }
-                .accessibilityLabel("清除文件类型选择")
-            Spacer(minLength: 0)
-            ApplicationPicker(kinds: model.selectedKinds, model: model)
-                .frame(width: applicationColumnWidth, height: 28)
+        HStack(spacing: 16) {
+            HStack(spacing: 12) {
+                Text(model.selectedIDs.isEmpty ? "文件类型" : "已选 \(model.selectedIDs.count) 项")
+                    .monospacedDigit()
+                    .fixedSize()
+                Spacer(minLength: 0)
+                Button("全选") { model.selectAllVisible() }
+                    .accessibilityLabel("选择当前列表全部文件类型")
+                if !model.selectedIDs.isEmpty {
+                    Button("清除") { model.clearSelection() }
+                        .accessibilityLabel("清除文件类型选择")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Group {
+                if model.selectedIDs.isEmpty {
+                    Text("默认应用").frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ApplicationPicker(kinds: model.selectedKinds, model: model)
+                }
+            }
+            .frame(width: applicationColumnWidth, height: 28)
         }
-        .font(.system(size: 11))
+        .font(.system(size: 11, weight: .medium))
         .buttonStyle(.plain)
         .padding(.horizontal, 20)
-        .frame(height: 36)
-        .background(Color.primary.opacity(0.055))
-        .padding(.top, 12)
+        .frame(height: 44)
+        .background(model.selectedIDs.isEmpty ? Color.clear : Color.primary.opacity(0.055))
         .disabled(model.busy)
     }
 
@@ -240,13 +274,24 @@ struct MainView: View {
             HStack(spacing: 7) {
                 if model.busy {
                     ProgressView().controlSize(.mini)
-                    Text("正在设置默认应用…")
+                    Text(operationStatus(model))
+                        .lineLimit(1).help(operationStatus(model))
+                    Spacer(minLength: 8)
+                    if model.progress != nil {
+                        Button(model.stopRequested ? "等待当前项完成…" : "停止剩余项") { model.requestStop() }
+                            .disabled(model.stopRequested)
+                            .fixedSize()
+                    }
                 } else {
                     Image(systemName: model.notice == nil ? "arrow.down.doc" : "checkmark")
                         .accessibilityHidden(true)
                     Text(model.notice ?? "Shift 连选 · ⌘ 多选 · 拖入文件查找").lineLimit(1).help(model.notice ?? "Shift 连选 · ⌘ 多选 · 拖入文件查找")
+                    Spacer(minLength: 8)
+                    if model.batchReport != nil {
+                        Button("结果") { showReport = true }
+                            .fixedSize()
+                    }
                 }
-                Spacer(minLength: 8)
                 Text("\(count) 项").monospacedDigit().fixedSize()
                 Divider().frame(height: 12).padding(.horizontal, 3)
                 Button {
@@ -318,34 +363,44 @@ struct TypeRow: View {
     var body: some View {
         let selected = model.selectedIDs.contains(kind.id)
         HStack(spacing: 16) {
-            Button {
-                let modifiers = (NSApp.currentEvent?.modifierFlags ?? []).union(NSEvent.modifierFlags)
-                model.select(kind, extending: modifiers.contains(.shift), toggling: modifiers.contains(.command))
-            } label: {
-                HStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Button {
+                    model.select(kind, toggling: true)
+                } label: {
                     Image(systemName: selected ? "checkmark.square.fill" : "square")
                         .font(.system(size: 13))
                         .foregroundStyle(selected ? Color.primary : Color.secondary)
-                        .frame(width: 14)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(kind.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
-                        Text(kind.subtitle)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 0)
+                        .frame(width: 22, height: 32)
+                        .contentShape(Rectangle())
                 }
-                .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityLabel("选择\(kind.title)")
+                .accessibilityValue(selected ? "已选择" : "未选择")
+                .accessibilityHint("点击切换选择")
+                Button {
+                    let modifiers = (NSApp.currentEvent?.modifierFlags ?? []).union(NSEvent.modifierFlags)
+                    model.select(kind, extending: modifiers.contains(.shift), toggling: modifiers.contains(.command))
+                } label: {
+                    HStack(spacing: 0) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(kind.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                            Text(kind.subtitle)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(kind.title)，\(kind.subtitle)")
+                .accessibilityValue(selected ? "已选择" : "未选择")
+                .accessibilityHint("按住 Shift 连续选择，按住 Command 切换选择")
+                .accessibilityAddTraits(selected ? .isSelected : [])
             }
-            .buttonStyle(.plain)
             .disabled(model.busy)
-            .accessibilityLabel("\(kind.title)，\(kind.subtitle)")
-            .accessibilityValue(selected ? "已选择" : "未选择")
-            .accessibilityHint("按住 Shift 连续选择，按住 Command 切换选择")
-            .accessibilityAddTraits(selected ? .isSelected : [])
             ApplicationPicker(kind: kind, model: model)
                 .frame(width: applicationColumnWidth, height: 28)
                 .disabled(model.busy)
@@ -549,9 +604,43 @@ struct AppIcon: View {
     }
 }
 
+@MainActor
+private func operationStatus(_ model: AppModel) -> String {
+    guard let progress = model.progress else { return "正在设置默认应用…" }
+    let action = progress.isUndo ? "正在恢复" : "正在设置"
+    return "\(action) \(min(progress.completed + 1, progress.total))/\(progress.total) · \(progress.currentTitle)"
+}
+
+private func batchNeedsAttention(_ report: BatchReport?) -> Bool {
+    guard let result = report?.result else { return false }
+    return result.stopped || result.unprocessed > 0 || !result.failures.isEmpty
+}
+
+private struct HistoryGroup: Identifiable {
+    let id: UUID
+    let batchID: UUID?
+    var records: [ChangeRecord]
+    var canUndo: Bool { records.contains { $0.restoredAt == nil && $0.oldPath != nil } }
+}
+
 struct HistoryView: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) var dismiss
+    @ViewState private var showReport = false
+
+    private var groups: [HistoryGroup] {
+        var result: [HistoryGroup] = []
+        var indices: [UUID: Int] = [:]
+        for record in model.history {
+            let id = record.batchID ?? record.id
+            if let index = indices[id] { result[index].records.append(record) }
+            else {
+                indices[id] = result.count
+                result.append(HistoryGroup(id: id, batchID: record.batchID, records: [record]))
+            }
+        }
+        return result
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -572,43 +661,166 @@ struct HistoryView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(model.history) { record in
-                            HStack(spacing: 12) {
-                                AppIcon(url: URL(fileURLWithPath: record.newPath), size: 28)
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(record.title).font(.system(size: 12, weight: .medium))
-                                    Text("\(model.appName(record.oldPath.map { URL(fileURLWithPath: $0) })) → \(model.appName(URL(fileURLWithPath: record.newPath)))")
-                                        .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-                                    Text(record.date.formatted(date: .abbreviated, time: .shortened))
-                                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                                }
-                                Spacer(minLength: 8)
-                                if record.restoredAt != nil {
-                                    Text("已撤销").font(.system(size: 11)).foregroundStyle(.secondary)
-                                } else if record.oldPath == nil {
-                                    Text("无原始应用").font(.system(size: 11)).foregroundStyle(.secondary)
-                                } else {
-                                    Button("撤销") { Task { await model.undo(record) } }
+                        ForEach(groups) { group in
+                            if let batchID = group.batchID {
+                                HStack(spacing: 8) {
+                                    Text("批量修改 · \(group.records.count) 项")
+                                        .fontWeight(.medium)
+                                    Spacer(minLength: 8)
+                                    Button("撤销本批") { Task { await model.undoBatch(batchID) } }
                                         .controlSize(.small)
-                                        .disabled(model.busy)
-                                        .accessibilityLabel("撤销\(record.title)的默认应用修改")
+                                        .disabled(model.busy || !group.canUndo)
                                 }
+                                .font(.system(size: 11))
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 10)
+                                .background(Color.primary.opacity(0.055))
                             }
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 12)
-                            Divider().padding(.horizontal, 20)
+                            ForEach(group.records) { record in
+                                historyRow(record)
+                                Divider().padding(.horizontal, 20)
+                            }
                         }
                     }
                 }
             }
             Divider()
-            Text("仅记录在 Openly 中完成的修改 · 最近 50 条")
-                .font(.system(size: 10)).foregroundStyle(.secondary)
-                .padding(.horizontal, 20).frame(height: 32)
+            HStack(spacing: 8) {
+                if model.busy {
+                    ProgressView().controlSize(.mini)
+                    Text(operationStatus(model)).lineLimit(1)
+                    Spacer(minLength: 8)
+                    if model.progress != nil {
+                        Button(model.stopRequested ? "等待当前项完成…" : "停止剩余项") { model.requestStop() }
+                            .disabled(model.stopRequested).fixedSize()
+                    }
+                } else {
+                    Text("仅记录 Openly 中的修改 · 最近 50 次操作")
+                    Spacer(minLength: 8)
+                    if model.batchReport != nil {
+                        Button("结果") { showReport = true }
+                    }
+                }
+            }
+            .font(.system(size: 10)).foregroundStyle(.secondary)
+            .padding(.horizontal, 20).frame(height: 36)
         }
         .frame(width: 560, height: 400)
-        .alert("无法撤销", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+        .alert("无法撤销", isPresented: Binding(get: { model.error != nil && !showReport }, set: { if !$0 { model.error = nil } })) {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
+        .sheet(isPresented: $showReport) { BatchReportView().environmentObject(model) }
+        .onChange(of: model.batchReport?.id) { id in
+            if id != nil && batchNeedsAttention(model.batchReport) { showReport = true }
+        }
+    }
+
+    private func historyRow(_ record: ChangeRecord) -> some View {
+        HStack(spacing: 12) {
+            AppIcon(url: URL(fileURLWithPath: record.newPath), size: 28)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(record.title).font(.system(size: 12, weight: .medium))
+                Text("\(model.appName(record.oldPath.map { URL(fileURLWithPath: $0) })) → \(model.appName(URL(fileURLWithPath: record.newPath)))")
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Text(record.date.formatted(date: .abbreviated, time: .shortened))
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if record.restoredAt != nil {
+                Text("已撤销").font(.system(size: 11)).foregroundStyle(.secondary)
+            } else {
+                if record.pending == true {
+                    Text("待确认").font(.system(size: 11)).foregroundStyle(.secondary)
+                        .help("上次设置尚未确认完成；撤销前会检查当前默认应用。")
+                }
+                if record.oldPath == nil {
+                    Text("无原始应用").font(.system(size: 11)).foregroundStyle(.secondary)
+                } else {
+                    Button("撤销") { Task { await model.undo(record) } }
+                        .controlSize(.small)
+                        .disabled(model.busy)
+                        .accessibilityLabel("撤销\(record.title)的默认应用修改")
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+}
+
+private struct BatchReportView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(model.batchReport?.isUndo == true ? "批量恢复结果" : "批量修改结果")
+                    .font(.system(size: 18, weight: .semibold))
+                Spacer()
+                Button("完成") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            .padding(20)
+            Divider()
+            if model.busy {
+                VStack(spacing: 16) {
+                    ProgressView().controlSize(.small)
+                    Text(operationStatus(model)).font(.system(size: 12))
+                    Button(model.stopRequested ? "等待当前项完成…" : "停止剩余项") { model.requestStop() }
+                        .disabled(model.stopRequested)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let report = model.batchReport {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(report.summary).font(.system(size: 12, weight: .medium))
+                    if report.result.stopped {
+                        Text("已停止后续操作，完成的修改已保存。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    if report.result.unprocessed > 0 {
+                        Text("还有 \(report.result.unprocessed) 项未处理。")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(20)
+                if report.result.failures.isEmpty {
+                    Spacer(minLength: 0)
+                } else {
+                    Divider()
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(Array(report.result.failures.enumerated()), id: \.offset) { _, failure in
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(failure.title).font(.system(size: 12, weight: .medium))
+                                    Text(failure.message)
+                                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        .textSelection(.enabled)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 12)
+                                Divider().padding(.horizontal, 20)
+                            }
+                        }
+                    }
+                }
+                Divider()
+                HStack {
+                    Spacer()
+                    if model.canRetryBatch {
+                        Button("重试失败及未完成项") { Task { await model.retryBatch() } }
+                            .controlSize(.regular)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .frame(height: 52)
+            } else {
+                Text("暂无批量结果")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(width: 520, height: 360)
     }
 }

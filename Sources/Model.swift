@@ -69,6 +69,9 @@ struct ChangeRecord: Codable, Identifiable {
     let newPath: String
     let date: Date
     var restoredAt: Date?
+    var batchID: UUID? = nil
+    var pending: Bool? = nil
+    var operationID: UUID { batchID ?? id }
 }
 
 struct BatchFailure {
@@ -81,6 +84,22 @@ struct BatchResult {
     var changed = 0
     var unchanged = 0
     var failures: [BatchFailure] = []
+    var unprocessed = 0
+    var stopped = false
+}
+
+struct BatchProgress {
+    let completed: Int
+    let total: Int
+    let currentTitle: String
+    let isUndo: Bool
+}
+
+struct BatchReport: Identifiable {
+    let id: UUID
+    let result: BatchResult
+    let isUndo: Bool
+    let summary: String
 }
 
 protocol AssociationService {
@@ -98,13 +117,14 @@ struct SystemAssociations: AssociationService {
 }
 
 enum AppFailure: LocalizedError {
-    case invalidApp, unavailableType, changedElsewhere, verification
+    case invalidApp, unavailableType, changedElsewhere, verification, noPreviousApp
     var errorDescription: String? {
         switch self {
         case .invalidApp: return "找不到这个应用，请重新选择已安装的 .app。"
         case .unavailableType: return "系统无法识别这个文件类型。"
         case .changedElsewhere: return "此类型的默认应用已经再次改变。请刷新列表后手动选择，避免覆盖后来的设置。"
         case .verification: return "系统尚未返回预期的默认应用。请刷新确认后重试。"
+        case .noPreviousApp: return "这项修改原本没有默认应用，无法自动恢复。"
         }
     }
 }
@@ -120,6 +140,9 @@ final class AppModel: ObservableObject {
     @Published var busy = false
     @Published var notice: String?
     @Published var error: String?
+    @Published private(set) var progress: BatchProgress?
+    @Published private(set) var stopRequested = false
+    @Published private(set) var batchReport: BatchReport?
     private let service: AssociationService
     private let preferences: UserDefaults
     private var extra: [String]
@@ -129,6 +152,12 @@ final class AppModel: ObservableObject {
     private let names = NSCache<NSURL, NSString>()
     private let icons = NSCache<NSURL, NSImage>()
     private var selectionAnchor: String?
+    private enum RetryContext {
+        case change([FileKind], URL, UUID)
+        case undo([UUID])
+    }
+    private var retryContext: RetryContext?
+    var canRetryBatch: Bool { retryContext != nil && !busy }
 
     init(service: AssociationService = SystemAssociations(), preferences: UserDefaults = .standard, now: @escaping () -> Date = Date.init) {
         self.service = service
@@ -138,8 +167,12 @@ final class AppModel: ObservableObject {
         icons.countLimit = 32
         icons.totalCostLimit = 512 * 1024
         self.extra = preferences.stringArray(forKey: "customExtensions") ?? []
-        self.typeOverrides = preferences.dictionary(forKey: "typeOverrides") as? [String: String] ?? [:]
-        if let data = preferences.data(forKey: "history"), let saved = try? JSONDecoder().decode([ChangeRecord].self, from: data) { history = Array(saved.prefix(50)) }
+        let storedOverrides = preferences.dictionary(forKey: "typeOverrides") as? [String: String] ?? [:]
+        self.typeOverrides = storedOverrides.filter { !Self.isLinkType($0.value) }
+        if typeOverrides != storedOverrides { preferences.set(typeOverrides, forKey: "typeOverrides") }
+        if let data = preferences.data(forKey: "history"), let saved = try? JSONDecoder().decode([ChangeRecord].self, from: data) {
+            history = Self.recentOperations(saved)
+        }
         kinds = FileKind.make(extra: extra, overrides: typeOverrides)
         refresh()
     }
@@ -254,11 +287,20 @@ final class AppModel: ObservableObject {
             return image
         }
     }
+    private static func validExtension(_ input: String) -> String? {
+        let ext = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !ext.isEmpty, ext.count <= 40,
+            ext.rangeOfCharacter(from: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-+")).inverted) == nil,
+            UTType(filenameExtension: ext) != nil else { return nil }
+        return ext
+    }
+    private static func isLinkType(_ identifier: String) -> Bool {
+        identifier == "public.symlink" || identifier == "com.apple.alias-file"
+    }
     func addExtension(_ input: String) {
         guard !busy else { return }
-        let ext = input.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        guard !ext.isEmpty, ext.count <= 40, ext.rangeOfCharacter(from: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-+")).inverted) == nil,
-              let type = UTType(filenameExtension: ext) else {
+        guard let ext = Self.validExtension(input), let type = UTType(filenameExtension: ext) else {
             error = "请输入有效扩展名，例如 pdf、md 或 mkv。"; return
         }
         if !kinds.contains(where: { $0.extensions.contains(ext) }) {
@@ -275,115 +317,262 @@ final class AppModel: ObservableObject {
     func importFile(_ url: URL) {
         guard !busy else { return }
         do {
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .contentTypeKey])
-            guard values.isDirectory != true, !url.pathExtension.isEmpty else {
-                error = "请拖入带有扩展名的文件，文件夹和应用不适用。"; return
+            guard url.isFileURL else { throw AppFailure.unavailableType }
+            // A link's extension and content type describe the link, not its target.
+            let target = url.resolvingSymlinksInPath()
+            let values = try target.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .contentTypeKey, .isSymbolicLinkKey, .isAliasFileKey])
+            guard values.isRegularFile == true, values.isDirectory != true,
+                values.isSymbolicLink != true, values.isAliasFile != true,
+                let ext = Self.validExtension(target.pathExtension) else {
+                error = "请拖入带有有效扩展名的文件，文件夹、应用和无效链接不适用。"; return
             }
-            // Ask the file itself: its actual type can differ from a simple extension lookup.
-            guard let actualType = values.contentType else { throw AppFailure.unavailableType }
-            typeOverrides[url.pathExtension.lowercased()] = actualType.identifier
+            guard let actualType = values.contentType, !Self.isLinkType(actualType.identifier) else { throw AppFailure.unavailableType }
+            // Validate everything before committing either preference.
+            if !kinds.contains(where: { $0.extensions.contains(ext) }) { extra.append(ext) }
+            typeOverrides[ext] = actualType.identifier
+            preferences.set(extra, forKey: "customExtensions")
             preferences.set(typeOverrides, forKey: "typeOverrides")
-            addExtension(url.pathExtension)
             kinds = FileKind.make(extra: extra, overrides: typeOverrides)
             clearSelection()
             let validIDs = Set(kinds.map(\.id))
             defaults = defaults.filter { validIDs.contains($0.key) }
             refresh(actualType)
+            group = .all
+            query = "." + ext
+            notice = "已定位 .\(ext) · \(actualType.localizedDescription ?? actualType.identifier)"
         } catch { self.error = error.localizedDescription }
     }
-    func change(_ kind: FileKind, to app: URL) async {
-        guard !busy else { return }
+    func requestStop() {
+        guard busy, progress != nil else { return }
+        stopRequested = true
+    }
+    func dismissBatchReport() {
+        batchReport = nil
+        retryContext = nil
+    }
+    private func beginOperation() {
         busy = true
         error = nil
         notice = nil
-        let historyHead = history.first?.id
-        defer {
-            if history.first?.id != historyHead { saveHistory() }
-            pruneSelection()
-            busy = false
-        }
+        batchReport = nil
+        retryContext = nil
+        stopRequested = false
+    }
+    private func finishOperation() {
+        progress = nil
+        stopRequested = false
+        busy = false
+    }
+    func change(_ kind: FileKind, to app: URL) async {
+        guard !busy else { return }
+        beginOperation()
+        defer { pruneSelection(); finishOperation() }
         do {
             try validateApp(app)
-            let changed = try await applyChange(kind, to: app)
+            let changed = try await applyChange(kind, to: app, batchID: nil)
             notice = changed ? "\(kind.subtitle) → \(appName(app))" : "已经使用 \(appName(app)) 打开"
         } catch { self.error = error.localizedDescription; refresh(kind.type) }
     }
     @discardableResult
     func change(_ kinds: [FileKind], to app: URL) async -> BatchResult? {
         guard !busy else { return nil }
+        return await changeBatch(kinds, to: app, batchID: UUID())
+    }
+    private func changeBatch(_ kinds: [FileKind], to app: URL, batchID: UUID) async -> BatchResult? {
         var seen = Set<String>()
         let targets = kinds.filter { seen.insert($0.id).inserted }
         guard !targets.isEmpty else { return nil }
-        busy = true
-        error = nil
-        notice = nil
-        let historyHead = history.first?.id
-        defer {
-            if history.first?.id != historyHead { saveHistory() }
-            clearSelection()
-            busy = false
-        }
+        beginOperation()
+        defer { finishOperation() }
         var result = BatchResult()
+        var retry: [FileKind] = []
         do { try validateApp(app) }
         catch {
-            self.error = error.localizedDescription
             result.failures = targets.map { BatchFailure(typeID: $0.id, title: $0.title, message: error.localizedDescription) }
+            retry = targets
+            completeBatch(result, isUndo: false, retry: .change(retry, app, batchID), selected: retry)
             return result
         }
-        // macOS sets defaults per UTType, so a batch can partially fail or ask
-        // for consent more than once. Never pretend that this is an atomic write.
-        for kind in targets {
+        for (index, kind) in targets.enumerated() {
+            if stopRequested || Task.isCancelled {
+                result.stopped = true
+                result.unprocessed = targets.count - index
+                retry.append(contentsOf: targets[index...])
+                break
+            }
+            progress = BatchProgress(completed: index, total: targets.count, currentTitle: kind.title, isUndo: false)
             do {
-                if try await applyChange(kind, to: app) { result.changed += 1 }
+                if try await applyChange(kind, to: app, batchID: batchID) { result.changed += 1 }
                 else { result.unchanged += 1 }
             } catch {
                 result.failures.append(BatchFailure(typeID: kind.id, title: kind.title, message: error.localizedDescription))
+                retry.append(kind)
                 refresh(kind.type)
+                if Self.isCancellation(error) { stopRequested = true; result.stopped = true }
             }
+            progress = BatchProgress(completed: index + 1, total: targets.count, currentTitle: kind.title, isUndo: false)
         }
-        var summary = "已更改 \(result.changed) 种类型"
-        if result.unchanged > 0 { summary += " · \(result.unchanged) 种无需更改" }
-        if !result.failures.isEmpty {
-            summary += " · \(result.failures.count) 种失败"
-            let details = result.failures.prefix(8).map { "\($0.title)：\($0.message)" }.joined(separator: "\n")
-            self.error = "\(summary)\n\n\(details)" + (result.failures.count > 8 ? "\n另有 \(result.failures.count - 8) 种类型未完成。" : "")
-        }
-        notice = summary
+        completeBatch(result, isUndo: false, retry: retry.isEmpty ? nil : .change(retry, app, batchID), selected: retry)
         return result
     }
-    private func applyChange(_ kind: FileKind, to app: URL) async throws -> Bool {
+    func retryBatch() async {
+        guard !busy, let context = retryContext else { return }
+        switch context {
+        case let .change(kinds, app, batchID): _ = await changeBatch(kinds, to: app, batchID: batchID)
+        case let .undo(ids): await restoreBatch(ids)
+        }
+    }
+    private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        let failure = error as NSError
+        return (failure.domain == NSCocoaErrorDomain && failure.code == NSUserCancelledError) ||
+            (failure.domain == NSOSStatusErrorDomain && failure.code == -128)
+    }
+    private func completeBatch(_ result: BatchResult, isUndo: Bool, retry: RetryContext?, selected: [FileKind] = []) {
+        var summary = "已\(isUndo ? "恢复" : "更改") \(result.changed) 种类型"
+        if result.unchanged > 0 { summary += " · \(result.unchanged) 种无需更改" }
+        if !result.failures.isEmpty { summary += " · \(result.failures.count) 种失败" }
+        if result.unprocessed > 0 { summary += " · \(result.unprocessed) 种未处理" }
+        if result.stopped { summary = "已停止 · " + summary }
+        notice = summary
+        retryContext = retry
+        batchReport = BatchReport(id: UUID(), result: result, isUndo: isUndo, summary: summary)
+        // The retry snapshot also retains items hidden by an app-name filter.
+        selectedIDs = Set(selected.map(\.id)).intersection(visible.map(\.id))
+        selectionAnchor = nil
+    }
+    private func applyChange(_ kind: FileKind, to app: URL, batchID: UUID?) async throws -> Bool {
         let old = service.current(kind.type)
         if old?.standardizedFileURL == app.standardizedFileURL {
             if defaults[kind.id] != old { defaults[kind.id] = old }
             return false
         }
-        try await service.set(app, for: kind.type)
-        // Accepted writes retain a recovery record even if verification fails.
-        history.insert(ChangeRecord(id: UUID(), typeID: kind.id, title: kind.title,
-            oldPath: old?.path, newPath: app.path, date: Date()), at: 0)
-        if history.count > 50 { history.removeLast(history.count - 50) }
-        guard refresh(kind.type)?.standardizedFileURL == app.standardizedFileURL else { throw AppFailure.verification }
+        let record = ChangeRecord(id: UUID(), typeID: kind.id, title: kind.title,
+            oldPath: old?.path, newPath: app.path, date: now(), batchID: batchID, pending: true)
+        history.insert(record, at: 0)
+        // Save before crossing the asynchronous system boundary. A pending record
+        // remains recoverable even if the app exits before the callback arrives.
+        saveHistory()
+        do { try await service.set(app, for: kind.type) }
+        catch {
+            if Self.isCancellation(error), progress != nil { stopRequested = true }
+            let current = refresh(kind.type)
+            if current?.standardizedFileURL == app.standardizedFileURL {
+                confirmChange(record.id)
+                return true
+            }
+            if current?.standardizedFileURL == old?.standardizedFileURL {
+                history.removeAll { $0.id == record.id }
+            }
+            history = Self.recentOperations(history)
+            saveHistory()
+            throw error
+        }
+        guard refresh(kind.type)?.standardizedFileURL == app.standardizedFileURL else {
+            history = Self.recentOperations(history)
+            saveHistory()
+            throw AppFailure.verification
+        }
+        confirmChange(record.id)
         return true
     }
+    private func confirmChange(_ id: UUID) {
+        if let index = history.firstIndex(where: { $0.id == id }) { history[index].pending = false }
+        history = Self.recentOperations(history)
+        saveHistory()
+    }
     func undo(_ record: ChangeRecord) async {
-        guard !busy, record.restoredAt == nil, let oldPath = record.oldPath else { return }
-        busy = true
-        error = nil
-        notice = nil
-        defer { pruneSelection(); busy = false }
+        guard !busy, record.restoredAt == nil, record.oldPath != nil else { return }
+        beginOperation()
+        defer { pruneSelection(); finishOperation() }
         do {
-            guard let type = UTType(record.typeID) else { throw AppFailure.unavailableType }
-            let old = URL(fileURLWithPath: oldPath)
-            try validateApp(old)
-            guard service.current(type)?.standardizedFileURL == URL(fileURLWithPath: record.newPath).standardizedFileURL else { throw AppFailure.changedElsewhere }
-            try await service.set(old, for: type)
-            guard refresh(type)?.standardizedFileURL == old.standardizedFileURL else { throw AppFailure.verification }
-            if let index = history.firstIndex(where: { $0.id == record.id }) { history[index].restoredAt = Date() }
-            saveHistory()
+            _ = try await restore(record)
             notice = "已恢复 \(record.title) 的默认应用"
         } catch {
             self.error = error.localizedDescription
             if let type = UTType(record.typeID) { refresh(type) }
+        }
+    }
+    func undoBatch(_ batchID: UUID) async {
+        guard !busy else { return }
+        let ids = history.filter { $0.batchID == batchID && $0.restoredAt == nil }.map(\.id)
+        await restoreBatch(ids)
+    }
+    private func restoreBatch(_ ids: [UUID]) async {
+        let targets = ids.compactMap { id in history.first { $0.id == id && $0.restoredAt == nil } }
+        guard !targets.isEmpty else { return }
+        beginOperation()
+        defer { pruneSelection(); finishOperation() }
+        var result = BatchResult()
+        var retry: [UUID] = []
+        for (index, record) in targets.enumerated() {
+            if stopRequested || Task.isCancelled {
+                result.stopped = true
+                result.unprocessed = targets.count - index
+                retry.append(contentsOf: targets[index...].map(\.id))
+                break
+            }
+            progress = BatchProgress(completed: index, total: targets.count, currentTitle: record.title, isUndo: true)
+            do {
+                if try await restore(record) { result.changed += 1 }
+                else { result.unchanged += 1 }
+            } catch {
+                result.failures.append(BatchFailure(typeID: record.typeID, title: record.title, message: error.localizedDescription))
+                retry.append(record.id)
+                if let type = UTType(record.typeID) { refresh(type) }
+                if Self.isCancellation(error) { stopRequested = true; result.stopped = true }
+            }
+            progress = BatchProgress(completed: index + 1, total: targets.count, currentTitle: record.title, isUndo: true)
+        }
+        completeBatch(result, isUndo: true, retry: retry.isEmpty ? nil : .undo(retry))
+    }
+    private func restore(_ record: ChangeRecord) async throws -> Bool {
+        guard let oldPath = record.oldPath else { throw AppFailure.noPreviousApp }
+        guard let type = UTType(record.typeID) else { throw AppFailure.unavailableType }
+        let old = URL(fileURLWithPath: oldPath)
+        try validateApp(old)
+        let current = service.current(type)?.standardizedFileURL
+        // An interrupted write or undo can already be back at the original app.
+        if record.pending == true && current == old.standardizedFileURL {
+            markRestored(record.id)
+            refresh(type)
+            return false
+        }
+        guard current == URL(fileURLWithPath: record.newPath).standardizedFileURL else { throw AppFailure.changedElsewhere }
+        if let index = history.firstIndex(where: { $0.id == record.id }) { history[index].pending = true }
+        saveHistory()
+        do { try await service.set(old, for: type) }
+        catch {
+            if Self.isCancellation(error), progress != nil { stopRequested = true }
+            let updated = refresh(type)?.standardizedFileURL
+            if updated == old.standardizedFileURL {
+                markRestored(record.id)
+                return true
+            }
+            if updated == current, let index = history.firstIndex(where: { $0.id == record.id }) {
+                history[index].pending = record.pending
+                saveHistory()
+            }
+            throw error
+        }
+        guard refresh(type)?.standardizedFileURL == old.standardizedFileURL else { throw AppFailure.verification }
+        markRestored(record.id)
+        return true
+    }
+    private func markRestored(_ id: UUID) {
+        if let index = history.firstIndex(where: { $0.id == id }) {
+            history[index].restoredAt = now()
+            history[index].pending = false
+        }
+        saveHistory()
+    }
+    private static func recentOperations(_ records: [ChangeRecord]) -> [ChangeRecord] {
+        var groups = Set<UUID>()
+        return records.filter { record in
+            if groups.contains(record.operationID) { return true }
+            guard groups.count < 50 else { return false }
+            groups.insert(record.operationID)
+            return true
         }
     }
     private func validateApp(_ url: URL) throws {
